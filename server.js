@@ -196,4 +196,4 @@ http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: 'not found' });
 
-}).listen(PORT, () => console.log('Relay on port', PORT));
+.listen(PORT, '0.0.0.0', () => console.log('Relay on port', PORT));
